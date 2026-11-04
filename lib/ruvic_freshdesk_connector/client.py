@@ -16,6 +16,74 @@ from .config import FreshdeskConfig
 from .exceptions import FreshdeskAuthError, FreshdeskDataError, FreshdeskNetworkError
 from .logging_utils import get_logger
 
+# Nombres aceptados para los códigos estándar de Freshdesk. Los números se envían tal cual
+# (Freshdesk admite estados personalizados por encima de 5).
+_STATUS_ALIASES = {
+    "abierto": 2, "open": 2,
+    "pendiente": 3, "pending": 3,
+    "resuelto": 4, "resolved": 4,
+    "cerrado": 5, "closed": 5,
+}
+_PRIORITY_ALIASES = {
+    "baja": 1, "low": 1,
+    "media": 2, "medium": 2,
+    "alta": 3, "high": 3,
+    "urgente": 4, "urgent": 4,
+}
+
+_VALID_TEXT = {
+    "status": "2 (Abierto), 3 (Pendiente), 4 (Resuelto), 5 (Cerrado)",
+    "priority": "1 (Baja), 2 (Media), 3 (Alta), 4 (Urgente)",
+}
+
+def _parse_id(value: Any, name: str = "ticket_id") -> int:
+    """Convierte un ID a entero positivo con un error claro si no lo es."""
+    try:
+        number = int(str(value).strip().lstrip("#"))
+    except (TypeError, ValueError):
+        raise FreshdeskDataError(f"{name} debe ser un número entero positivo; se recibió '{value}'.") from None
+    if number <= 0:
+        raise FreshdeskDataError(f"{name} debe ser mayor que cero; se recibió '{value}'.")
+    return number
+
+
+def _parse_code(field: str, value: Any, aliases: dict[str, int]) -> int:
+    text = str(value).strip()
+    if text.lower() in aliases:
+        return aliases[text.lower()]
+    try:
+        return int(text)
+    except ValueError:
+        valid = _VALID_TEXT[field]
+        raise FreshdeskDataError(f"{field} '{value}' no válido. Valores aceptados: {valid}.") from None
+
+
+def _normalize_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(fields)
+    if "status" in normalized:
+        normalized["status"] = _parse_code("status", normalized["status"], _STATUS_ALIASES)
+    if "priority" in normalized:
+        normalized["priority"] = _parse_code("priority", normalized["priority"], _PRIORITY_ALIASES)
+    return normalized
+
+
+def _readable_error(response: Response) -> str:
+    """Convierte el JSON de validación de Freshdesk en un texto legible."""
+    try:
+        payload = response.json()
+    except ValueError:
+        return response.text[:500]
+    if isinstance(payload, dict) and isinstance(payload.get("errors"), list):
+        parts = []
+        for err in payload["errors"]:
+            if isinstance(err, dict):
+                field = err.get("field") or "general"
+                parts.append(f"{field}: {err.get('message') or err.get('code')}")
+        if parts:
+            return f"{payload.get('description') or 'Error de validación'} — " + "; ".join(parts)
+    return str(payload)[:500]
+
+
 class FreshdeskClient:
     """Cliente para gestión de tickets en Freshdesk.
 
@@ -42,11 +110,11 @@ class FreshdeskClient:
         if response.status_code in {401, 403}:
             raise FreshdeskAuthError(f"Freshdesk rechazó autenticación o permisos ({response.status_code}). Revisa dominio, API key y permisos del agente.")
         if response.status_code == 404:
-            raise FreshdeskDataError("Recurso Freshdesk no encontrado. Verifica ticket_id o endpoint.")
+            raise FreshdeskDataError("No se encontró el recurso en Freshdesk (404). Verifica que el ticket_id exista.")
         if response.status_code == 429:
             raise FreshdeskDataError("Freshdesk aplicó rate limiting (429). Espera y reintenta más tarde.")
         if response.status_code >= 400:
-            raise FreshdeskDataError(f"Freshdesk retornó HTTP {response.status_code}: {response.text[:500]}")
+            raise FreshdeskDataError(f"Freshdesk rechazó la solicitud (HTTP {response.status_code}): {_readable_error(response)}")
         if not response.content:
             return {}
         try:
@@ -98,7 +166,8 @@ class FreshdeskClient:
         if not subject.strip(): raise FreshdeskDataError("subject no puede estar vacío.")
         if not description.strip(): raise FreshdeskDataError("description no puede estar vacío.")
         if "@" not in email: raise FreshdeskDataError("email debe ser un correo válido.")
-        payload = {"subject": subject, "description": description, "email": email, "priority": int(priority), "status": int(status), **extra_fields}
+        payload = {"subject": subject, "description": description, "email": email, "priority": priority, "status": status, **extra_fields}
+        payload = _normalize_fields(payload)
         if custom_fields:
             payload["custom_fields"] = custom_fields
         data = self._request("POST", "/tickets", json_body=payload)
@@ -117,9 +186,10 @@ class FreshdeskClient:
             >>> client.update_ticket(123, {'priority': 3, 'status': 2})
             {'id': 123, 'priority': 3}
         """
-        if int(ticket_id) <= 0: raise FreshdeskDataError("ticket_id debe ser mayor que cero.")
+        ticket_id = _parse_id(ticket_id)
         if not fields: raise FreshdeskDataError("fields no puede estar vacío.")
-        data = self._request("PUT", f"/tickets/{int(ticket_id)}", json_body=fields)
+        fields = _normalize_fields(fields)
+        data = self._request("PUT", f"/tickets/{ticket_id}", json_body=fields)
         self._logger.info("Ticket Freshdesk actualizado")
         return dict(data)
 
@@ -136,9 +206,9 @@ class FreshdeskClient:
             >>> client.add_note(123, 'Se escaló al equipo N2')
             {'id': 456, 'body': 'Se escaló al equipo N2'}
         """
-        if int(ticket_id) <= 0: raise FreshdeskDataError("ticket_id debe ser mayor que cero.")
+        ticket_id = _parse_id(ticket_id)
         if not body.strip(): raise FreshdeskDataError("body no puede estar vacío.")
-        data = self._request("POST", f"/tickets/{int(ticket_id)}/notes", json_body={"body": body, "private": bool(private)})
+        data = self._request("POST", f"/tickets/{ticket_id}/notes", json_body={"body": body, "private": bool(private)})
         self._logger.info("Nota agregada a ticket Freshdesk")
         return dict(data)
 
@@ -154,7 +224,7 @@ class FreshdeskClient:
             >>> client.get_ticket(123)
             {'id': 123, 'subject': 'Error login'}
         """
-        if int(ticket_id) <= 0: raise FreshdeskDataError("ticket_id debe ser mayor que cero.")
-        data = self._request("GET", f"/tickets/{int(ticket_id)}", params={"include": include})
+        ticket_id = _parse_id(ticket_id)
+        data = self._request("GET", f"/tickets/{ticket_id}", params={"include": include})
         self._logger.info("Ticket Freshdesk consultado")
         return dict(data)

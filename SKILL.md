@@ -33,6 +33,15 @@ from ruvic_freshdesk_connector import FreshdeskClient
 client = FreshdeskClient()
 ```
 
+## Valores válidos
+
+| Campo | Valores |
+|---|---|
+| `status` | 2 Abierto, 3 Pendiente, 4 Resuelto, 5 Cerrado. Acepta el número o el nombre ("Pendiente") |
+| `priority` | 1 Baja, 2 Media, 3 Alta, 4 Urgente. Acepta el número o el nombre ("Urgente") |
+
+Los IDs son enteros (`123` o `"123"`); un ID no numérico lanza `FreshdeskDataError` con un mensaje claro.
+
 ## Capacidad 1 — Crear ticket
 
 ```python
